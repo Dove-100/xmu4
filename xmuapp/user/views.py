@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 
 from django.contrib.auth.hashers import check_password
 from django.db import models
@@ -10,6 +11,7 @@ from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import status, permissions
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -19,12 +21,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .serializers import LoginSerializer, AdminAccountListRequestSerializer, AdminAccountListSerializer, \
     UniversalStudentDetailSerializer, SafeTeacherPendingApplicationListSerializer, UserContactUpdateSerializer, \
     ChangePasswordSerializer, BulkUserImportSerializer, StudentRegistrationSerializer, TeacherRegistrationSerializer, \
-    TeacherDetailSerializer
+    TeacherDetailSerializer, CreateFeedbackSerializer, FeedbackListSerializer
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
 
 from django.shortcuts import get_object_or_404
-from .models import User
+from .models import User, Feedback
 from score.models import AcademicPerformance
 from application.models import Application, Attachment
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -34,7 +36,93 @@ import pandas as pd
 from django.db import transaction
 from rest_framework.parsers import MultiPartParser, FormParser
 
+from django.conf import settings
+
 User = get_user_model()
+
+
+class TwoFactorSetupView(APIView):
+    """获取2FA设置信息（生成二维码）"""
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        # 如果已经启用2FA，返回错误
+        if user.is_2fa_enabled:
+            return Response({
+                'error': '2FA已启用',
+                'code': '2FA_ALREADY_ENABLED'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 生成新的密钥（如果还没有的话）
+        if not user.secret_key:
+            user.generate_2fa_secret()
+
+        # 生成二维码
+        import qrcode
+        import base64
+        from io import BytesIO
+
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+
+        # 生成OTP URI
+        otp_uri = f"otpauth://totp/XMUGraduate:{user.school_id}?secret={user.secret_key}&issuer=XMUGraduate"
+        qr.add_data(otp_uri)
+        qr.make(fit=True)
+
+        # 创建二维码图片
+        img = qr.make_image(fill_color="black", back_color="white")
+
+        # 转换为base64
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+        qr_data_url = f"data:image/png;base64,{qr_base64}"
+
+        return Response({
+            'secret': user.secret_key,
+            'QRCode': qr_data_url,
+            'message': '请使用身份验证器应用扫描二维码，然后输入生成的6位验证码完成设置。',
+        })
+
+
+class VerifyAndEnable2FAView(APIView):
+    """验证并启用2FA"""
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        code = request.data.get('code', '').strip()
+
+        if not code:
+            return Response({
+                'error': '请提供验证码',
+                'code': 'CODE_REQUIRED'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # 验证验证码
+        if user.verify_totp(code):
+            user.enable_2fa()
+
+            return Response({
+                'status': 'success',
+                'message': '2FA已成功启用',
+                'warning': '请妥善保管备份代码，每个代码只能使用一次。'
+            })
+        else:
+            return Response({
+                'error': '验证码无效',
+                'code': 'INVALID_CODE'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
 
 class LoginView(APIView):
     permission_classes = []
@@ -56,7 +144,117 @@ class LoginView(APIView):
                 'contact': user.contact,
                 'email': user.email,
             })
+        elif serializer.errors.get('non_field_errors')[0].code == 'requires_2fa_code' or serializer.errors.get('non_field_errors')[0].code == 'invalid_2fa_code':
+            return Response(status=status.HTTP_401_UNAUTHORIZED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+class Reset2faView(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request):
+        """
+        重置2fa
+        请求参数:
+        - accounts: ["学号1", "学号2", ...] 或 ["*"] 表示所有用户
+        """
+        try:
+            # 权限验证：只有超管（user_type=2）可以操作
+            if not hasattr(request.user, 'user_type') or request.user.user_type != 2:
+                return Response({
+                    'success': False,
+                    'message': '权限不足，只有超级管理员可以重置2fa'
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            data = request.data
+
+            # 获取目标用户学号列表
+            accounts = data.get('accounts', [])
+
+            if not accounts or not isinstance(accounts, list):
+                return Response({
+                    'success': False,
+                    'message': '请提供accounts参数，格式为字符串数组'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # 🎯 处理特殊参数：["*"] 表示所有用户
+            if accounts == ["*"]:
+                # 重置所有用户的密码
+                all_users = User.objects.all()
+
+                for target_user in all_users:
+                    target_user.reset2fa()
+            else:
+                # 重置指定学号的用户
+                for school_id in accounts:
+                    target_user = User.objects.get(school_id=school_id)
+                    target_user.reset2fa()
+
+            return Response({
+                'success': True,
+                'message': '重置2fa成功'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': f'重置密码失败: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+
+class LogoutView(APIView):
+    """
+    用户退出登录接口
+    支持两种退出方式：
+    1. 清除当前用户的Token（API调用）
+    2. 清除所有用户的Token（强制所有设备退出）
+    """
+    permission_classes = [IsAuthenticated]  # 需要认证的用户才能退出
+
+    def post(self, request):
+        """
+        退出当前设备登录（清除当前Token）
+        """
+        try:
+            # 获取当前用户的Token
+            token = Token.objects.get(user=request.user)
+            token.delete()
+
+            # 可选：执行Django的登出逻辑（清除session等）
+            # logout(request)
+
+            # 记录日志
+            print(f"✅ 用户 {request.user.school_id} ({request.user.name}) 已退出登录")
+
+            return Response({
+                'code': 200,
+                'message': '退出登录成功',
+                'user_id': str(request.user.id),
+                'school_id': request.user.school_id,
+                'name': request.user.name
+            }, status=status.HTTP_200_OK)
+
+        except Token.DoesNotExist:
+            # Token不存在，但依然返回成功
+            print(f"⚠️ 用户 {request.user.school_id} 的Token不存在，但已视为退出成功")
+            return Response({
+                'code': 200,
+                'message': '用户未登录或Token已失效',
+                'user_id': str(request.user.id),
+                'school_id': request.user.school_id,
+                'name': request.user.name
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            print(f"❌ 退出登录时发生错误: {str(e)}")
+            return Response({
+                'code': 500,
+                'message': '退出登录失败，请稍后重试',
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
@@ -341,7 +539,7 @@ class UserDetailView(APIView):
                 user_type_text = "教师"
 
             logger.info(f"用户详情查询成功: {user_id} (类型: {user_type_text})")
-
+            print(serializer.data)
             return Response({
                 'success': True,
                 'message': f'获取{user_type_text}详情成功',
@@ -976,90 +1174,100 @@ class UserContactUpdateView(APIView):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from django.contrib.auth.hashers import check_password, make_password
+
+
 class ChangePasswordView(APIView):
     """
-    用户修改密码接口
-    PUT /api/user/change-password/
+    修改密码接口
     """
     permission_classes = [IsAuthenticated]
 
     def put(self, request):
         """
         修改用户密码
+        前端字段: oldpassword, newpassword
         """
         try:
-            print("=== 密码修改请求开始 ===")
-            print(f"用户: {request.user.school_id}")
+            data = request.data
 
-            # 验证请求数据
-            serializer = ChangePasswordSerializer(data=request.data)
+            old_password = data.get('oldpassword')
+            new_password = data.get('newpassword')
 
-            if not serializer.is_valid():
-                print("❌ 数据验证失败:", serializer.errors)
+            if not old_password:
                 return Response({
-                    "success": False,
-                    "message": "数据验证失败",
-                    "errors": serializer.errors
+                    'success': False,
+                    'message': '请输入原密码'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            # 提取验证后的数据
-            old_password = serializer.validated_data['old_password']
-            new_password = serializer.validated_data['new_password']
+            if not new_password:
+                return Response({
+                    'success': False,
+                    'message': '请输入新密码'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            print("✅ 数据验证通过")
-
-            # 验证原密码是否正确
             user = request.user
-            if not check_password(old_password, user.password):
-                print("❌ 原密码验证失败")
-                return Response({
-                    "success": False,
-                    "message": "原密码不正确",
-                    "errors": {
-                        'old_password': ['原密码不正确']
-                    }
-                }, status=status.HTTP_400_BAD_REQUEST)
 
-            print("✅ 原密码验证通过")
+            if not hasattr(user, 'password'):
+                return Response({
+                    'success': False,
+                    'message': '用户数据异常'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
             try:
-                with transaction.atomic():
-                    # 更新密码
-                    user.set_password(new_password)
-                    user.save()
+                is_correct = check_password(old_password, user.password)
+            except Exception:
+                return Response({
+                    'success': False,
+                    'message': '密码验证失败'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-                    # 更新session认证，避免用户被登出
-                    update_session_auth_hash(request, user)
+            if not is_correct:
+                return Response({
+                    'success': False,
+                    'message': '原密码不正确'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-                    print("✅ 密码更新成功")
+            if old_password == new_password:
+                return Response({
+                    'success': False,
+                    'message': '新密码不能与旧密码相同'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-                    return Response({
-                        "success": True,
-                        "message": "密码修改成功",
-                        "data": None
-                    }, status=status.HTTP_200_OK)
+            if len(new_password) < 6:
+                return Response({
+                    'success': False,
+                    'message': '密码长度不能少于6位'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                hashed_password = make_password(new_password)
+                user.password = hashed_password
+                user.save()
+
+                return Response({
+                    'success': True,
+                    'message': '密码修改成功',
+                    'data': {
+                        'user_id': str(user.id),
+                        'school_id': user.school_id
+                    }
+                }, status=status.HTTP_200_OK)
 
             except Exception as save_error:
-                print(f"❌ 密码保存失败: {str(save_error)}")
                 return Response({
-                    "success": False,
-                    "message": "密码修改失败，请稍后重试",
-                    "errors": {
-                        'system': ['系统错误，请稍后重试']
-                    }
+                    'success': False,
+                    'message': f'密码保存失败'
                 }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         except Exception as e:
-            print(f"❌ 密码修改过程异常: {str(e)}")
-            import traceback
-            print(f"异常堆栈: {traceback.format_exc()}")
-
             return Response({
-                "success": False,
-                "message": "修改密码过程中发生错误",
-                "errors": {
-                    'system': ['系统错误，请稍后重试']
-                }
+                'success': False,
+                'message': f'密码修改失败'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -1779,7 +1987,7 @@ class DownloadStudentTemplateView(APIView):
     """
     下载学生导入Excel模板
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = []
 
     def get(self, request):
         """
@@ -1788,11 +1996,11 @@ class DownloadStudentTemplateView(APIView):
         """
         try:
             # 权限验证
-            if request.user.user_type != 2:
-                return Response({
-                    'success': False,
-                    'message': '只有超级管理员可以下载模板'
-                }, status=status.HTTP_403_FORBIDDEN)
+            # if request.user.user_type != 2:
+            #     return Response({
+            #         'success': False,
+            #         'message': '只有超级管理员可以下载模板'
+            #     }, status=status.HTTP_403_FORBIDDEN)
 
             # 创建示例数据
             sample_data = [
@@ -2496,255 +2704,272 @@ class DownloadTeacherTemplateView(APIView):
 
 from django.db import transaction
 
+from django.db import transaction
+from django.utils import timezone
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from user.models import User
+from application.models import Application, Attachment
+
 
 class DeleteUserView(APIView):
     """
-    删除用户接口
+    删除用户接口 - 支持批量删除和全部删除
+    前端输入格式: {accounts: ["学号1", "学号2", ...]} 或 {accounts: ["*"]}
     """
     permission_classes = [IsAuthenticated]
 
-    def delete(self, request, school_id=None):
+    def put(self, request):
         """
-        删除用户
-        DELETE /api/superadmin/users/delete/<user_id>/
-        或
+        删除用户 - 支持批量删除
         DELETE /api/superadmin/users/delete/
-        参数: user_id (可选，URL参数或请求体)
+        参数: {accounts: ["学号1", "学号2", ...]} 或 {accounts: ["*"]}
         """
         try:
-            print("=== 删除用户请求开始 ===")
-            print(f"操作者: {request.user.school_id} (类型: {request.user.user_type})")
+            data = request.data
 
             # 🎯 权限验证（仅超级管理员）
-            if request.user.user_type != 2:
-                print(f"❌ 权限拒绝: 用户 {request.user.school_id} 不是超级管理员")
+            if not hasattr(request.user, 'user_type') or request.user.user_type != 2:
                 return Response({
                     'success': False,
                     'message': '只有超级管理员可以删除用户',
                     'data': None
                 }, status=status.HTTP_403_FORBIDDEN)
 
-            # 🎯 获取要删除的用户ID
-            target_user_id = school_id or request.data.get('school_id') or request.query_params.get('school_id')
+            # 🎯 获取要删除的用户学号列表
+            accounts = data.get('accounts', [])
 
-            if not target_user_id:
-                print("❌ 未指定要删除的用户ID")
+            if not accounts or not isinstance(accounts, list):
                 return Response({
                     'success': False,
-                    'message': '请提供要删除的用户ID',
+                    'message': '请提供accounts参数，格式为字符串数组',
                     'data': None
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            print(f"目标用户ID: {target_user_id}")
-
-            # 🎯 查找目标用户
-            try:
-                target_user = User.objects.get(id=target_user_id)
-                print(f"找到目标用户: {target_user.school_id} ({target_user.name})")
-            except User.DoesNotExist:
-                print(f"❌ 用户不存在: {target_user_id}")
-                return Response({
-                    'success': False,
-                    'message': '用户不存在',
-                    'data': None
-                }, status=status.HTTP_404_NOT_FOUND)
-
-            # 🎯 安全检查：不能删除自己
-            if target_user.id == request.user.id:
-                print("❌ 不能删除自己")
-                return Response({
-                    'success': False,
-                    'message': '不能删除自己的账号',
-                    'data': None
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            # 🎯 安全检查：不能删除其他管理员
-            if target_user.user_type == 2 and target_user.id != request.user.id:
-                print("❌ 不能删除其他超级管理员")
-                return Response({
-                    'success': False,
-                    'message': '不能删除其他超级管理员的账号',
-                    'data': None
-                }, status=status.HTTP_403_FORBIDDEN)
-
-            # 🎯 记录用户信息（用于响应和日志）
-            user_info = {
-                'id': str(target_user.id),
-                'school_id': target_user.school_id,
-                'name': target_user.name,
-                'user_type': target_user.user_type,
-                'user_type_display': target_user.get_user_type_display(),
-                'college': target_user.college or '',
-                'major': target_user.major or '',
-                'grade': target_user.grade or '',
-                'created_at': target_user.date_joined.isoformat() if target_user.date_joined else None,
-                'last_login': target_user.last_login.isoformat() if target_user.last_login else None,
+            # 记录操作者信息
+            operator_info = {
+                'operator_id': str(request.user.id),
+                'operator_school_id': request.user.school_id,
+                'operator_name': getattr(request.user, 'name', ''),
+                'operation_time': int(timezone.now().timestamp() * 1000)
             }
 
-            print(f"用户信息: {user_info}")
+            results = []
+            success_count = 0
+            fail_count = 0
+            total_related_data_deleted = 0
 
-            # 🎯 检查用户相关数据
-            related_data = self.check_user_related_data(target_user)
-            print(f"相关数据统计: {related_data}")
+            # 🎯 处理特殊参数：["*"] 表示删除所有非管理员用户
+            if accounts == ["*"]:
+                # 获取所有非管理员用户（不能删除其他管理员）
+                target_users = User.objects.exclude(user_type=2)
+                total_users = target_users.count()
 
-            # 🎯 确认删除（如果需要二次确认）
-            confirm = request.data.get('confirm', False)
-            if not confirm and related_data['total_count'] > 0:
-                # 如果用户有相关数据，需要二次确认
-                print("⚠️ 用户有相关数据，需要二次确认")
-                return Response({
-                    'success': False,
-                    'message': '用户有相关数据，请确认删除',
-                    'data': {
-                        'user_info': user_info,
-                        'related_data': related_data,
-                        'requires_confirmation': True,
-                        'warning': f"该用户有 {related_data['total_count']} 条相关数据，删除后将无法恢复"
-                    }
-                }, status=status.HTTP_200_OK)  # 返回200，让前端处理确认
+                for target_user in target_users:
+                    try:
+                        # 安全检查：不能删除自己
+                        if target_user.id == request.user.id:
+                            results.append({
+                                'success': False,
+                                'school_id': target_user.school_id,
+                                'error': '不能删除自己的账号'
+                            })
+                            fail_count += 1
+                            continue
 
-            # 🎯 执行删除操作（使用事务）
-            try:
-                with transaction.atomic():
-                    # 记录操作日志
-                    self.log_deletion_operation(request.user, target_user, related_data)
+                        # 执行删除
+                        deleted_info = self.delete_single_user(target_user)
 
-                    # 执行删除
-                    deleted_info = self.delete_user_with_related_data(target_user)
+                        results.append({
+                            'success': True,
+                            'school_id': target_user.school_id,
+                            'name': getattr(target_user, 'name', ''),
+                            'user_type': target_user.user_type,
+                            'related_data_deleted': deleted_info
+                        })
+                        success_count += 1
+                        total_related_data_deleted += deleted_info.get('total_count', 0)
 
-                    print(f"✅ 用户删除成功: {target_user.school_id}")
+                    except Exception as e:
+                        results.append({
+                            'success': False,
+                            'school_id': target_user.school_id if hasattr(target_user, 'school_id') else '未知',
+                            'error': str(e)
+                        })
+                        fail_count += 1
 
-                    return Response({
-                        'success': True,
-                        'message': f'用户 {target_user.name}({target_user.school_id}) 删除成功',
-                        'data': {
-                            'deleted_user': user_info,
-                            'related_data_deleted': deleted_info,
-                            'deleted_at': timezone.now().isoformat(),
-                            'operator': request.user.school_id
-                        }
-                    }, status=status.HTTP_200_OK)
+                message = f'删除用户操作完成，共处理 {total_users} 个用户，成功: {success_count}，失败: {fail_count}'
 
-            except Exception as e:
-                print(f"❌ 删除操作失败: {e}")
-                return Response({
-                    'success': False,
-                    'message': f'删除失败: {str(e)}',
-                    'data': None
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            else:
+                # 删除指定学号的用户
+                for school_id in accounts:
+                    try:
+                        if not isinstance(school_id, str):
+                            results.append({
+                                'success': False,
+                                'school_id': str(school_id),
+                                'error': '学号格式错误，应为字符串'
+                            })
+                            fail_count += 1
+                            continue
+
+                        # 查找目标用户
+                        try:
+                            target_user = User.objects.get(school_id=school_id)
+                        except User.DoesNotExist:
+                            results.append({
+                                'success': False,
+                                'school_id': school_id,
+                                'error': '用户不存在'
+                            })
+                            fail_count += 1
+                            continue
+
+                        # 安全检查：不能删除其他管理员
+                        if target_user.user_type == 2 and target_user.id != request.user.id:
+                            results.append({
+                                'success': False,
+                                'school_id': school_id,
+                                'error': '不能删除其他超级管理员的账号'
+                            })
+                            fail_count += 1
+                            continue
+
+                        # 安全检查：不能删除自己
+                        if target_user.id == request.user.id:
+                            results.append({
+                                'success': False,
+                                'school_id': school_id,
+                                'error': '不能删除自己的账号'
+                            })
+                            fail_count += 1
+                            continue
+
+                        # 执行删除
+                        deleted_info = self.delete_single_user(target_user)
+
+                        results.append({
+                            'success': True,
+                            'school_id': target_user.school_id,
+                            'name': getattr(target_user, 'name', ''),
+                            'user_type': target_user.user_type,
+                            'related_data_deleted': deleted_info
+                        })
+                        success_count += 1
+                        total_related_data_deleted += deleted_info.get('total_count', 0)
+
+                    except Exception as e:
+                        results.append({
+                            'success': False,
+                            'school_id': school_id if isinstance(school_id, str) else str(school_id),
+                            'error': str(e)
+                        })
+                        fail_count += 1
+
+                message = f'删除用户操作完成，成功: {success_count}，失败: {fail_count}'
+
+            # 构建响应数据
+            response_data = {
+                'success': True,
+                'message': message,
+                'data': {
+                    'operation': {
+                        'type': 'all_users' if accounts == ["*"] else 'selected_users',
+                        'accounts': accounts,
+                        'cannot_delete_admins': accounts == ["*"]  # 全删时自动排除管理员
+                    },
+                    'statistics': {
+                        'total_attempted': len(accounts) if accounts != ["*"] else 'all_non_admin',
+                        'success': success_count,
+                        'fail': fail_count,
+                        'related_data_deleted': total_related_data_deleted
+                    },
+                    'operator': operator_info,
+                    'results': results[:100],  # 限制返回结果数量
+                    'delete_time': int(timezone.now().timestamp() * 1000)
+                }
+            }
+
+            # 如果结果太多，只返回摘要
+            if len(results) > 100:
+                response_data['data']['results'] = results[:100]
+                response_data['data']['has_more'] = True
+                response_data['data']['total_results'] = len(results)
+                response_data['message'] += f'（显示前100条结果，共{len(results)}条）'
+
+            return Response(response_data, status=status.HTTP_200_OK)
 
         except Exception as e:
-            print(f"❌ 删除用户异常: {str(e)}")
-            import traceback
-            traceback.print_exc()
             return Response({
                 'success': False,
-                'message': f'删除过程中发生错误: {str(e)}',
-                'data': None
+                'message': f'删除用户失败: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    def check_user_related_data(self, user):
+    def delete_single_user(self, user):
         """
-        检查用户相关数据
-        """
-        related_data = {
-            'applications_count': 0,
-            'attachments_count': 0,
-            'academic_performance': False,
-            'total_count': 0
-        }
-
-        try:
-            # 1. 检查申请记录
-            if hasattr(user, 'application_set'):
-                applications = user.application_set.all()
-                related_data['applications_count'] = applications.count()
-
-            # 2. 检查附件（通过申请间接关联）
-            # 注意：附件可能被多个申请共享，需要特别处理
-
-            # 3. 检查学业成绩
-            if hasattr(user, 'academic_performance'):
-                related_data['academic_performance'] = True
-
-            # 4. 检查其他可能的关系
-            # 可以根据实际模型添加
-
-            # 计算总数
-            total = related_data['applications_count']
-            if related_data['academic_performance']:
-                total += 1
-            related_data['total_count'] = total
-
-        except Exception as e:
-            print(f"检查相关数据异常: {e}")
-
-        return related_data
-
-    def delete_user_with_related_data(self, user):
-        """
-        删除用户及其相关数据
+        删除单个用户及其相关数据
+        返回删除的关联数据统计
         """
         deleted_info = {
-            'user_deleted': True,
             'applications_deleted': 0,
             'academic_performance_deleted': False,
-            'attachments_handled': 0
+            'attachments_deleted': 0,
+            'total_count': 0
         }
 
         user_school_id = user.school_id
 
         try:
-            # 1. 先处理申请记录
-            if hasattr(user, 'application_set'):
-                applications = user.application_set.all()
-                application_ids = list(applications.values_list('id', flat=True))
+            with transaction.atomic():
+                # 1. 删除申请记录
+                if hasattr(user, 'application_set'):
+                    applications = user.application_set.all()
+                    application_count = applications.count()
 
-                # 处理申请相关的附件
-                attachments_handled = self.handle_application_attachments(applications)
-                deleted_info['attachments_handled'] = attachments_handled
+                    # 处理申请相关的附件
+                    attachments_deleted = self.handle_application_attachments(applications)
+                    deleted_info['attachments_deleted'] = attachments_deleted
 
-                # 删除申请记录
-                applications.delete()
-                deleted_info['applications_deleted'] = len(application_ids)
-                print(f"删除 {len(application_ids)} 条申请记录")
+                    # 删除申请记录
+                    applications.delete()
+                    deleted_info['applications_deleted'] = application_count
 
-            # 2. 删除学业成绩
-            if hasattr(user, 'academic_performance'):
-                user.academic_performance.delete()
-                deleted_info['academic_performance_deleted'] = True
-                print("删除学业成绩记录")
+                # 2. 删除学业成绩
+                if hasattr(user, 'academic_performance'):
+                    user.academic_performance.delete()
+                    deleted_info['academic_performance_deleted'] = True
 
-            # 3. 删除用户Token（如果使用DRF Token）
-            try:
-                from rest_framework.authtoken.models import Token
-                Token.objects.filter(user=user).delete()
-                print("删除用户Token")
-            except:
-                pass
+                # 3. 删除用户Token（如果使用DRF Token）
+                try:
+                    from rest_framework.authtoken.models import Token
+                    Token.objects.filter(user=user).delete()
+                except:
+                    pass
 
-            # 4. 最后删除用户
-            user.delete()
-            deleted_info['user_deleted'] = True
+                # 4. 最后删除用户
+                user.delete()
 
-            print(f"✅ 用户 {user_school_id} 及其相关数据已删除")
+                # 计算总数
+                total = deleted_info['applications_deleted'] + deleted_info['attachments_deleted']
+                if deleted_info['academic_performance_deleted']:
+                    total += 1
+                deleted_info['total_count'] = total
 
         except Exception as e:
-            print(f"删除相关数据异常: {e}")
-            raise
+            raise Exception(f'删除用户 {user_school_id} 失败: {str(e)}')
 
         return deleted_info
 
     def handle_application_attachments(self, applications):
         """
         处理申请相关的附件
-        策略：如果附件只被当前用户的申请引用，则删除；否则保留
+        如果附件只被当前用户的申请引用，则删除；否则保留
         """
-        attachments_handled = 0
+        attachments_deleted = 0
 
         try:
-
-
             # 收集所有附件ID
             all_attachment_ids = []
             for application in applications:
@@ -2757,8 +2982,6 @@ class DeleteUserView(APIView):
 
             if not unique_attachment_ids:
                 return 0
-
-            print(f"处理 {len(unique_attachment_ids)} 个附件")
 
             # 检查每个附件的引用次数
             for attachment_id in unique_attachment_ids:
@@ -2781,51 +3004,454 @@ class DeleteUserView(APIView):
                             if os.path.exists(file_path):
                                 try:
                                     os.remove(file_path)
-                                    print(f"删除物理文件: {file_path}")
                                 except:
                                     pass
 
                         # 删除数据库记录
                         attachment.delete()
-                        attachments_handled += 1
-                        print(f"删除附件: {attachment.name}")
-                    else:
-                        print(f"保留附件（被 {reference_count} 个申请引用）: {attachment.name}")
+                        attachments_deleted += 1
 
                 except Attachment.DoesNotExist:
                     continue
-                except Exception as e:
-                    print(f"处理附件异常: {e}")
+                except Exception:
+                    continue
 
-        except Exception as e:
-            print(f"处理附件异常: {e}")
+        except Exception:
+            pass
 
-        return attachments_handled
+        return attachments_deleted
 
-    def log_deletion_operation(self, operator, target_user, related_data):
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from django.contrib.auth.hashers import make_password
+from .models import User
+import time
+
+
+class AdminResetPasswordView(APIView):
+    """
+    超管重置密码接口 - 支持accounts数组格式
+    重置用户密码为: 123456
+    支持特殊参数 accounts: ["*"] 重置所有用户
+    """
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request):
         """
-        记录删除操作日志
+        重置用户密码为默认值 123456
+        请求参数:
+        - accounts: ["学号1", "学号2", ...] 或 ["*"] 表示所有用户
         """
         try:
-            log_message = (
-                f"超级管理员 {operator.school_id}({operator.name}) "
-                f"于 {timezone.now().strftime('%Y-%m-%d %H:%M:%S')} "
-                f"删除了用户 {target_user.school_id}({target_user.name})"
-            )
+            # 权限验证：只有超管（user_type=2）可以操作
+            if not hasattr(request.user, 'user_type') or request.user.user_type != 2:
+                return Response({
+                    'success': False,
+                    'message': '权限不足，只有超级管理员可以重置密码'
+                }, status=status.HTTP_403_FORBIDDEN)
 
-            if related_data['total_count'] > 0:
-                log_message += f"，同时删除了 {related_data['total_count']} 条相关数据"
+            data = request.data
 
-            print(f"📝 操作日志: {log_message}")
+            # 获取目标用户学号列表
+            accounts = data.get('accounts', [])
 
-            # 可以保存到数据库日志表
-            # OperationLog.objects.create(
-            #     operator=operator,
-            #     target_user=target_user,
-            #     action_type='delete_user',
-            #     description=log_message,
-            #     related_data_count=related_data['total_count']
-            # )
+            if not accounts or not isinstance(accounts, list):
+                return Response({
+                    'success': False,
+                    'message': '请提供accounts参数，格式为字符串数组'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # 记录操作者信息
+            operator_info = {
+                'operator_id': str(request.user.id),
+                'operator_school_id': request.user.school_id,
+                'operator_name': getattr(request.user, 'name', ''),
+                'operation_time': int(time.time() * 1000)
+            }
+
+            results = []
+            success_count = 0
+            fail_count = 0
+            default_password = '123456'
+            hashed_password = make_password(default_password)
+
+            # 🎯 处理特殊参数：["*"] 表示所有用户
+            if accounts == ["*"]:
+                # 重置所有用户的密码
+                all_users = User.objects.all()
+                total_users = all_users.count()
+
+                for target_user in all_users:
+                    try:
+                        # 记录旧密码哈希
+                        old_password_hash = target_user.password[:20] + '...' if target_user.password else '无'
+
+                        # 重置密码
+                        target_user.password = hashed_password
+                        target_user.save()
+
+                        results.append({
+                            'success': True,
+                            'school_id': target_user.school_id,
+                            'name': getattr(target_user, 'name', ''),
+                            'user_type': target_user.user_type,
+                            'old_password_hash': old_password_hash
+                        })
+                        success_count += 1
+
+                    except Exception as e:
+                        results.append({
+                            'success': False,
+                            'school_id': target_user.school_id if hasattr(target_user, 'school_id') else '未知',
+                            'error': str(e)
+                        })
+                        fail_count += 1
+
+                message = f'已重置所有用户（共 {total_users} 人）的密码为 123456，成功: {success_count}，失败: {fail_count}'
+
+            else:
+                # 重置指定学号的用户
+                for school_id in accounts:
+                    try:
+                        if not isinstance(school_id, str):
+                            results.append({
+                                'success': False,
+                                'school_id': str(school_id),
+                                'error': '学号格式错误，应为字符串'
+                            })
+                            fail_count += 1
+                            continue
+
+                        # 查找目标用户
+                        try:
+                            target_user = User.objects.get(school_id=school_id)
+                        except User.DoesNotExist:
+                            results.append({
+                                'success': False,
+                                'school_id': school_id,
+                                'error': '用户不存在'
+                            })
+                            fail_count += 1
+                            continue
+
+                        # 记录旧密码哈希
+                        old_password_hash = target_user.password[:20] + '...' if target_user.password else '无'
+
+                        # 重置密码
+                        target_user.password = hashed_password
+                        target_user.save()
+
+                        results.append({
+                            'success': True,
+                            'school_id': target_user.school_id,
+                            'name': getattr(target_user, 'name', ''),
+                            'user_type': target_user.user_type,
+                            'old_password_hash': old_password_hash
+                        })
+                        success_count += 1
+
+                    except Exception as e:
+                        results.append({
+                            'success': False,
+                            'school_id': school_id if isinstance(school_id, str) else str(school_id),
+                            'error': str(e)
+                        })
+                        fail_count += 1
+
+                message = f'密码重置完成，成功: {success_count}，失败: {fail_count}'
+
+            # 构建响应数据
+            response_data = {
+                'success': True,
+                'message': message,
+                'data': {
+                    'operation': {
+                        'type': 'all_users' if accounts == ["*"] else 'selected_users',
+                        'accounts': accounts,
+                        'default_password': default_password
+                    },
+                    'statistics': {
+                        'total_attempted': len(accounts) if accounts != ["*"] else 'all',
+                        'success': success_count,
+                        'fail': fail_count,
+                        'success_rate': f'{(success_count / (success_count + fail_count) * 100):.1f}%' if (
+                                                                                                                      success_count + fail_count) > 0 else '0%'
+                    },
+                    'operator': operator_info,
+                    'results': results[:100],  # 限制返回结果数量，避免响应过大
+                    'reset_time': int(time.time() * 1000)
+                }
+            }
+
+            # 如果结果太多，只返回摘要
+            if len(results) > 100:
+                response_data['data']['results'] = results[:100]
+                response_data['data']['has_more'] = True
+                response_data['data']['total_results'] = len(results)
+                response_data['message'] += f'（显示前100条结果，共{len(results)}条）'
+
+            return Response(response_data, status=status.HTTP_200_OK)
 
         except Exception as e:
-            print(f"记录操作日志异常: {e}")
+            return Response({
+                'success': False,
+                'message': f'重置密码失败: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# views/admin_export.py
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
+import time
+
+from user.utils.export_utils import UserExporter
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ExportUsersView(APIView):
+    """
+    超管导出用户信息接口
+    返回下载链接格式: {success: bool, message: str, data: {filelink: str}}
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request):
+        print("=== 导出用户信息请求 ===")
+        print(f"👤 请求用户: {request.user.school_id} ({request.user.name})")
+        print(f"📤 请求数据: {request.data}")
+
+        start_time = time.time()
+
+        # 1. 权限验证
+        if request.user.user_type != 2:
+            return Response({
+                'success': False,
+                'message': '仅超级管理员可执行此操作',
+                'code': 'PERMISSION_DENIED'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # 2. 验证输入数据
+        accounts = request.data.get('accounts', [])
+        if not isinstance(accounts, list):
+            return Response({
+                'success': False,
+                'message': '参数格式错误，accounts应为数组',
+                'code': 'INVALID_PARAMETER'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. 执行导出
+        try:
+            file_info = UserExporter.export_users_to_excel(accounts, request.user)
+
+            # 计算耗时
+            elapsed_time = time.time() - start_time
+
+            # 返回相对路径的下载链接
+            response_data = {
+                'filelink': file_info['url'],  # 这里已经是相对路径
+                'filename': file_info['filename']
+            }
+
+            print(f"✅ 导出完成，返回文件链接: {file_info['url']}")
+            return Response(response_data, status=status.HTTP_200_OK)
+
+        except ValueError as e:
+            print(f"❌ 业务错误: {e}")
+            return Response({
+                'success': False,
+                'message': str(e),
+                'code': 'EXPORT_ERROR'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            print(f"❌ 系统错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+            return Response({
+                'success': False,
+                'message': f'导出失败: {str(e)}',
+                'code': 'SYSTEM_ERROR'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class CleanupExportsView(APIView):
+    """清理旧的导出文件接口"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if request.user.user_type != 2:
+            return Response({
+                'success': False,
+                'message': '权限不足'
+            }, status=403)
+
+        try:
+            max_hours = request.data.get('max_hours', 24)
+            max_files = request.data.get('max_files', 100)
+
+            UserExporter.cleanup_old_files(max_hours, max_files)
+
+            return Response({
+                'success': True,
+                'message': f'已清理超过{max_hours}小时或超过{max_files}个的旧文件'
+            })
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': str(e)
+            }, status=500)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class ListExportsView(APIView):
+    """列出所有导出文件接口"""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if request.user.user_type != 2:
+            return Response({
+                'success': False,
+                'message': '权限不足'
+            }, status=403)
+
+        import os
+        import glob
+        import json
+
+        files = glob.glob(os.path.join(settings.EXPORT_ROOT, '*.xlsx'))
+        files_info = []
+
+        for filepath in files:
+            filename = os.path.basename(filepath)
+            stats = os.stat(filepath)
+
+            files_info.append({
+                'filename': filename,
+                'url': UserExporter.get_export_url(filename),
+                'size': stats.st_size,
+                'created_time': int(stats.st_mtime * 1000),
+                'download_count': 0  # 可以扩展记录下载次数
+            })
+
+        # 按创建时间倒序
+        files_info.sort(key=lambda x: x['created_time'], reverse=True)
+
+        return Response({
+            'success': True,
+            'data': {
+                'files': files_info,
+                'count': len(files_info)
+            }
+        })
+
+
+class CreateFeedbackView(APIView):
+    """创建反馈视图"""
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        """创建新反馈"""
+        user = request.user
+
+        serializer = CreateFeedbackSerializer(data=request.data)
+
+        if serializer.is_valid():
+            content = serializer.validated_data['content']
+
+            try:
+                # 创建反馈
+                feedback = Feedback.objects.create(
+                    school_id = user.school_id,
+                    name=user.name,
+                    identity=user.user_type,  # 0=学生, 1=老师
+                    content=content,
+                    status=0,  # 未处理
+                    uploadtime=timezone.now()
+                )
+
+                return Response({
+                    'status': 'success',
+                    'message': '反馈提交成功',
+                }, status=status.HTTP_200_OK)
+
+            except Exception as e:
+                logger.error(f"创建反馈失败: {e}")
+                return Response({
+                    'error': '提交失败，请稍后重试',
+                    'code': 'CREATE_FAILED'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+class ListFeedbacksView(APIView):
+    """获取反馈列表视图（仅限管理员）"""
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """获取反馈列表"""
+        user = request.user
+
+        # 检查用户权限（只有管理员可以查看反馈列表）
+        if user.user_type != 2:
+            return Response({
+                'error': '只有超级管理员可以查看反馈列表',
+                'code': 'PERMISSION_DENIED'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            # 获取查询参数
+            status_filter = request.GET.get('Status', None)
+            identity_filter = request.GET.get('Identity', None)
+
+            # 基本查询
+            feedbacks = Feedback.objects.all()
+
+            # 状态筛选
+            if status_filter is not None:
+                try:
+                    status_val = int(status_filter)
+                    if status_val in [0, 1]:
+                        feedbacks = feedbacks.filter(status=status_val)
+                except ValueError:
+                    pass
+
+            # 身份筛选
+            if identity_filter is not None:
+                try:
+                    identity_val = int(identity_filter)
+                    if identity_val in [0, 1]:
+                        feedbacks = feedbacks.filter(submitter_identity=identity_val)
+                except ValueError:
+                    pass
+
+            # 序列化数据
+            serializer = FeedbackListSerializer(feedbacks, many=True)
+
+            response_data = {
+                'feedbacks': serializer.data
+            }
+
+            return Response(response_data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"获取反馈列表失败: {e}")
+            return Response({
+                'error': '获取反馈列表失败',
+                'code': 'LIST_FAILED'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -3,82 +3,107 @@ from decimal import Decimal
 from score.models import AcademicPerformance
 
 
-def update_academic_performance_score(application):
+def update_academic_performance_score(self, application, original_score):
     """
     更新学生学业成绩中的申请项目分数
     """
     try:
-        with transaction.atomic():
-            # 获取学生和学业成绩记录
-            student = application.user
-            academic_perf, created = AcademicPerformance.objects.get_or_create(
-                user=student
-            )
+        from score.models import AcademicPerformance
+        from decimal import Decimal
 
-            # 获取申请类型和实际得分
-            application_type = application.Type
-            real_score = getattr(application, 'RealScore', getattr(application, 'Real_Score', 0))
+        student = application.user
+        application_type = getattr(application, 'Type', getattr(application, 'application_type', None))
 
-            print(f"更新学业成绩: 学生={student.name}, 申请类型={application_type}, 得分={real_score}")
+        if application_type is None:
+            return False
 
-            # 根据申请类型更新对应的成绩字段
-            if application_type in AcademicPerformance.SCORE_TYPES:
-                score_type_name = AcademicPerformance.SCORE_TYPES[application_type]
-                academic_perf.set_score(application_type, real_score)
+        try:
+            academic_perf = AcademicPerformance.objects.get(user=student)
+        except AcademicPerformance.DoesNotExist:
+            return False
 
-                print(f"设置 {score_type_name}[{application_type}] = {real_score}")
+        score_list = list(academic_perf.applications_score)
 
-                # 重新计算总分
-                recalculate_total_scores(academic_perf)
+        while len(score_list) <= application_type:
+            score_list.append(0.0)
 
-                academic_perf.save()
-                print(f"学业成绩更新完成")
+        current_type_score = float(score_list[application_type]) if isinstance(score_list[application_type],
+                                                                               (int, float, Decimal)) else 0.0
+        original_app_score = float(original_score)
+        new_score = max(0.0, current_type_score - original_app_score)
+        score_list[application_type] = new_score
+
+        processed_score_list = []
+        for score in score_list:
+            if isinstance(score, Decimal):
+                processed_score_list.append(float(score))
+            elif isinstance(score, (int, float)):
+                processed_score_list.append(score)
             else:
-                print(f"未知的申请类型: {application_type}")
+                try:
+                    processed_score_list.append(float(score))
+                except:
+                    processed_score_list.append(0.0)
+
+        academic_perf.applications_score = processed_score_list
+        self.recalculate_total_scores(academic_perf)
+        academic_perf.save()
+
+        return True
 
     except Exception as e:
-        print(f"更新学业成绩失败: {str(e)}")
-        raise
+        return False
 
 
-def recalculate_total_scores(academic_perf):
+def recalculate_total_scores(self, academic_perf):
     """
     重新计算学业专长成绩和总分
     """
     try:
-        # 计算学术专长成绩（前4项，满分15分）
+        from decimal import Decimal
+
+        if not isinstance(academic_perf.applications_score, list):
+            academic_perf.applications_score = [0.0] * 9
+
+        score_list = []
+        for item in academic_perf.applications_score:
+            if isinstance(item, Decimal):
+                score_list.append(float(item))
+            elif isinstance(item, (int, float)):
+                score_list.append(item)
+            else:
+                try:
+                    score_list.append(float(item))
+                except:
+                    score_list.append(0.0)
+
+        while len(score_list) < 9:
+            score_list.append(0.0)
+
         academic_expertise_scores = []
-        for i in range(4):  # 0-3: 学术竞赛、创新训练、学术研究、荣誉称号
-            if i < len(academic_perf.applications_score):
-                score = academic_perf.applications_score[i]
-                academic_expertise_scores.append(min(float(score), 5.0))  # 每项最高5分
+        for i in range(4):
+            score = score_list[i]
+            academic_expertise_scores.append(min(score, 5.0))
 
         academic_expertise_total = sum(academic_expertise_scores)
-        academic_perf.academic_expertise_score = Decimal(str(min(academic_expertise_total, 15.0)))  # 满分15分
+        academic_perf.academic_expertise_score = Decimal(str(min(academic_expertise_total, 15.0)))
 
-        # 计算综合表现成绩（后5项，满分5分）
         comprehensive_scores = []
-        for i in range(4, 9):  # 4-8: 社会工作、志愿服务、国际实习、参军入伍、体育项目
-            if i < len(academic_perf.applications_score):
-                score = academic_perf.applications_score[i]
-                comprehensive_scores.append(min(float(score), 1.0))  # 每项最高1分
+        for i in range(4, 9):
+            score = score_list[i]
+            comprehensive_scores.append(min(score, 1.0))
 
         comprehensive_total = sum(comprehensive_scores)
-        academic_perf.comprehensive_performance_score = Decimal(str(min(comprehensive_total, 5.0)))  # 满分5分
+        academic_perf.comprehensive_performance_score = Decimal(str(min(comprehensive_total, 5.0)))
 
-        # 计算总分（学业成绩 + 学术专长 + 综合表现）
+        academic_score = float(getattr(academic_perf, 'academic_score', 0.0))
         total_score = (
-                academic_perf.academic_score +
+                Decimal(str(academic_score)) +
                 academic_perf.academic_expertise_score +
                 academic_perf.comprehensive_performance_score
         )
-        academic_perf.total_comprehensive_score = Decimal(str(min(total_score, 100.0)))  # 满分100分
 
-        print(f"重新计算总分: 学业={academic_perf.academic_score}, "
-              f"学术专长={academic_perf.academic_expertise_score}, "
-              f"综合表现={academic_perf.comprehensive_performance_score}, "
-              f"总分={academic_perf.total_comprehensive_score}")
+        academic_perf.total_comprehensive_score = Decimal(str(min(float(total_score), 100.0)))
 
     except Exception as e:
-        print(f"重新计算总分失败: {str(e)}")
         raise

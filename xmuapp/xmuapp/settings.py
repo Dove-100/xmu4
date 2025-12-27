@@ -158,3 +158,20 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_SCHEMA_CLASS': 'rest_framework.schemas.coreapi.AutoSchema',
 }
+
+
+# settings.py 添加配置
+
+import os
+from datetime import datetime
+
+# 媒体文件配置
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# 导出文件存储路径
+EXPORT_ROOT = os.path.join(MEDIA_ROOT, 'exports')
+EXPORT_URL = '/media/exports/'
+
+# 确保导出目录存在
+os.makedirs(EXPORT_ROOT, exist_ok=True)

@@ -305,17 +305,20 @@ class SafeTeacherPendingApplicationListSerializer(serializers.ModelSerializer):
         ]
 
     def get_Attachments(self, obj):
-        """获取附件列表"""
+        """安全获取附件列表"""
         try:
-            attachments = obj.Attachments.all()
-            return [
-                {
-                    'id': str(attachment.id),
-                    'name': attachment.name
-                }
-                for attachment in attachments
-            ]
+            if hasattr(obj, 'Attachments'):
+                attachments = obj.Attachments.all()
+                return [
+                    {
+                        'id': str(attachment.file_hash),
+                        'name': attachment.name or '未命名文件'
+                    }
+                    for attachment in attachments
+                ]
+            return []
         except Exception as e:
+            print(f"获取附件错误: {e}")
             return []
 
     def get_extra_data(self, obj):

@@ -3,7 +3,7 @@ import secrets
 
 from rest_framework import serializers
 from django.contrib.auth import authenticate
-from .models import User
+from .models import User, Feedback
 
 from score.models import AcademicPerformance
 from application.models import Application
@@ -12,16 +12,86 @@ from rest_framework import serializers
 from django.core.exceptions import ValidationError
 from .models import User
 
+from rest_framework import serializers
+import qrcode
+import base64
+from io import BytesIO
+from django.contrib.auth import authenticate
+from .models import User
+
+
+class TwoFactorSetupSerializer(serializers.Serializer):
+    """2FA设置序列化器"""
+    secret = serializers.CharField(read_only=True)
+    qr_code = serializers.CharField(read_only=True)
+
+    def to_representation(self, instance):
+        """生成2FA设置信息"""
+        user = instance
+
+        # 生成或获取密钥
+        secret = user.secret_key
+        if not secret:
+            secret = user.generate_2fa_secret()
+
+        # 生成二维码
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+
+        # 生成OTP URI
+        otp_uri = f"otpauth://totp/XMUGraduate:{user.school_id}?secret={secret}&issuer=XMUGraduate"
+        qr.add_data(otp_uri)
+        qr.make(fit=True)
+
+        # 创建二维码图片
+        img = qr.make_image(fill_color="black", back_color="white")
+
+        # 转换为base64
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+        qr_data_url = f"data:image/png;base64,{qr_base64}"
+
+        return {
+            'secret': secret,
+            'qr_code': qr_data_url,
+            'message': '请使用身份验证器应用（如Google Authenticator、Microsoft Authenticator等）扫描二维码，然后输入生成的6位验证码完成设置。'
+        }
+
+
+class Verify2FASerializer(serializers.Serializer):
+    """验证2FA序列化器"""
+    code = serializers.CharField(write_only=True, max_length=8)
+
+    def validate(self, data):
+        user = self.context['user']
+        code = data.get('code')
+
+        if not user.verify_totp(code):
+            raise serializers.ValidationError("验证码无效")
+
+        # 验证成功后启用2FA
+        if not user.is_2fa_enabled:
+            user.enable_2fa()
+
+        return data
+
 
 class LoginSerializer(serializers.Serializer):
     school_id = serializers.CharField()
     password = serializers.CharField(write_only=True, style={'input_type': 'password'})
     user_type = serializers.CharField()
+    code = serializers.CharField(required=False, allow_blank=True, max_length=8)
 
     def validate(self, data):
         school_id = data.get('school_id')
         password = data.get('password')
         user_type = data.get('user_type')
+        code = data.get('code', '')
 
         print(f"=== 登录验证 ===")
         print(f"学号: {school_id}")
@@ -59,12 +129,88 @@ class LoginSerializer(serializers.Serializer):
                 print(f"❌ 用户已被禁用: {school_id}")
                 raise serializers.ValidationError("账号已被禁用")
 
+            print(f"✅ 基础验证通过: {school_id} ")
+            print(f"2FA状态: enabled={user.is_2fa_enabled}, required={user.is_2fa_required}")
+
+            # 如果用户没有启用2FA，检查是否需要强制设置
+            if not user.is_2fa_enabled:
+                print(f"✅ 不需要2FA，直接登录")
+                data['user'] = user
+                data['requires_2fa'] = False
+                return data
+
+            # 🎯 第五步：用户已启用2FA，需要验证code
+            print(f"用户已启用2FA，验证验证码...")
+
+            if not code or not code.strip():
+                print(f"❌ 需要2FA验证码但未提供")
+                raise serializers.ValidationError(
+                    "需要双因素认证验证码",
+                    code='requires_2fa_code'
+                )
+
+            # 验证2FA验证码
+            if user.verify_totp(code.strip()):
+                print(f"✅ 2FA验证通过")
+                data['user'] = user
+                data['requires_2fa'] = True
+                data['code_valid'] = True
+                return data
+            else:
+                print(f"❌ 2FA验证码无效: {code}")
+                raise serializers.ValidationError(
+                    "双因素认证验证码无效",
+                    code='invalid_2fa_code'
+                )
+
             print(f"✅ 登录验证通过: {school_id} ({user.name})")
             data['user'] = user
             return data
         else:
             raise serializers.ValidationError("请提供学号/工号和密码")
 
+
+
+class VerifyLogin2FASerializer(serializers.Serializer):
+    """登录时验证2FA序列化器"""
+    school_id = serializers.CharField()
+    code = serializers.CharField(max_length=8)
+
+
+class Request2FAResetSerializer(serializers.Serializer):
+    """请求重置2FA序列化器"""
+    school_id = serializers.CharField()
+    user_type = serializers.CharField()
+
+    def validate(self, data):
+        school_id = data.get('school_id')
+        user_type = data.get('user_type')
+
+        try:
+            user = User.objects.get(school_id=school_id)
+        except User.DoesNotExist:
+            raise serializers.ValidationError("用户不存在")
+
+        # 验证用户类型
+        user_type_mapping = {
+            'student': 0,
+            'teacher': 1,
+            'super': 2
+        }
+
+        expected_type = user_type_mapping.get(user_type.lower())
+        if expected_type is None:
+            raise serializers.ValidationError("无效的用户类型")
+
+        if user.user_type != expected_type:
+            raise serializers.ValidationError("用户类型不匹配")
+
+        # 检查用户是否启用了2FA
+        if not user.is_2fa_enabled:
+            raise serializers.ValidationError("您的账户未启用双因素认证")
+
+        data['user'] = user
+        return data
 
 
 class AdminAccountListSerializer(serializers.ModelSerializer):
@@ -198,7 +344,7 @@ class UniversalStudentDetailSerializer(serializers.ModelSerializer):
         return f"{college}-{major}".rstrip('-')
 
     def get_email(self, obj):
-        return f"{obj.school_id}@xmu.edu.cn"
+        return f"{obj.email}"
 
     def get_rank(self, obj):
         """获取排名信息"""
@@ -270,16 +416,17 @@ class UniversalStudentDetailSerializer(serializers.ModelSerializer):
 
 # serializers.py - 教师序列化器
 class TeacherDetailSerializer(serializers.ModelSerializer):
+    name = serializers.CharField()
     department = serializers.CharField(source='college')
     phone = serializers.CharField(source='contact')
     email = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['department', 'phone', 'email']
+        fields = ['name','department', 'phone', 'email']
 
     def get_email(self, obj):
-        return f"{obj.school_id}@xmu.edu.cn"
+        return f"{obj.email}"
 
 
 class SafeTeacherPendingApplicationListSerializer(serializers.ModelSerializer):
@@ -869,3 +1016,92 @@ class ChangePasswordSerializer(serializers.Serializer):
             })
 
         return data
+
+
+
+
+class CreateFeedbackSerializer(serializers.Serializer):
+    """创建反馈序列化器"""
+    content = serializers.CharField(
+        max_length=2000,
+        min_length=1,
+        error_messages={
+            'required': '反馈内容不能为空',
+            'min_length': '反馈内容至少需要1个字符',
+            'max_length': '反馈内容不能超过2000个字符'
+        }
+    )
+
+    def validate_content(self, value):
+        """验证反馈内容"""
+        content = value.strip()
+        if not content:
+            raise serializers.ValidationError("反馈内容不能为空")
+
+        return content
+
+
+class FeedbackListSerializer(serializers.ModelSerializer):
+    """序列化器：后端小写 -> 前端大写"""
+    Status = serializers.SerializerMethodField()  # 前端字段名（大写）
+    UploadTime = serializers.SerializerMethodField()
+    ID = serializers.SerializerMethodField()
+    Identity = serializers.SerializerMethodField()
+    Name = serializers.SerializerMethodField()
+    Content = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Feedback
+        fields = ['Status', 'UploadTime', 'ID', 'Identity', 'Name', 'Content']  # 不在Meta中定义，完全自定义
+
+    def get_Status(self, obj):
+        """将后端的status映射到前端的Status"""
+        # obj.status 是后端字段（小写）
+        return obj.status
+
+    def get_UploadTime(self, obj):
+        """将后端的uploadtime映射到前端的UploadTime"""
+        return int(obj.uploadtime.timestamp() * 1000)
+
+    def get_ID(self, obj):
+        """将后端的school_id映射到前端的ID"""
+        return obj.school_id
+
+    def get_Identity(self, obj):
+        """将后端的identity映射到前端的Identity"""
+        return obj.identity
+
+    def get_Name(self, obj):
+        """将后端的name映射到前端的Name"""
+        return obj.name
+
+    def get_Content(self, obj):
+        """将后端的content映射到前端的Content"""
+        return obj.content
+
+class AdminFeedbackSerializer(serializers.ModelSerializer):
+    """管理员查看反馈详情序列化器"""
+
+    class Meta:
+        model = Feedback
+        fields = [
+            'id', 'content', 'status', 'uploadtime'
+        ]
+
+    def get_upload_time_str(self, obj):
+        """格式化上传时间"""
+        return obj.uploadtime.strftime('%Y-%m-%d %H:%M:%S') if obj.uploadtime else ''
+
+
+class ProcessFeedbackSerializer(serializers.Serializer):
+    """处理反馈序列化器"""
+    feedback_id = serializers.UUIDField()
+
+    def validate_feedback_id(self, value):
+        """验证反馈ID是否存在"""
+        try:
+            feedback = Feedback.objects.get(id=value, is_deleted=False)
+        except Feedback.DoesNotExist:
+            raise serializers.ValidationError("反馈不存在")
+
+        return feedback

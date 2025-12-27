@@ -14,12 +14,15 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import path, include
 from django.views.generic import TemplateView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/', include('user.api_urls')),
     path('api/auth/', include('user.api_urls')),
     path('api/score/', include('score.api_urls')),
     path('api/student/material/', include('application.api_urls')),
@@ -31,3 +34,8 @@ urlpatterns = [
     path('scores/', TemplateView.as_view(template_name='index.html'), name='scores'),
     path('applications/', TemplateView.as_view(template_name='index.html'), name='applications'),
 ]
+
+# 🔥 关键：确保这行代码在文件末尾，且没有缩进
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    print(f"✅ 媒体文件服务已启用: {settings.MEDIA_URL} -> {settings.MEDIA_ROOT}")
